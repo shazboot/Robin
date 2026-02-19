@@ -5,6 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# Change these to match your system
 User=YOUR_USERNAME
 WorkingDirectory=/home/YOUR_USERNAME/Robin
 ExecStart=/usr/bin/python3 /home/YOUR_USERNAME/Robin/trader.py
