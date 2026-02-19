@@ -1,0 +1,17 @@
+[Unit]
+Description=Robinhood Crypto Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USERNAME
+WorkingDirectory=/home/YOUR_USERNAME/Robin
+ExecStart=/usr/bin/python3 /home/YOUR_USERNAME/Robin/trader.py
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
