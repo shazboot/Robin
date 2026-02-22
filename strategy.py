@@ -49,11 +49,14 @@ def calculate_rsi(prices: List[float], period: int) -> float:
 
 def get_signal(prices: List[float]) -> str:
     """
-    Determine trading signal based on EMA crossover + RSI confirmation.
+    Determine trading signal based on EMA position + RSI confirmation.
+
+    BUY:  EMA-9 below EMA-21 (bearish position) AND RSI < oversold threshold
+    SELL: EMA-9 above EMA-21 (bullish position) AND RSI > overbought threshold
 
     Returns: "BUY", "SELL", or "HOLD"
     """
-    min_required = EMA_LONG + 2  # need current + previous EMA calculation
+    min_required = EMA_LONG + 2
     if len(prices) < min_required:
         return "WARMUP"
 
@@ -61,20 +64,14 @@ def get_signal(prices: List[float]) -> str:
     ema_short_now = calculate_ema(prices, EMA_SHORT)
     ema_long_now = calculate_ema(prices, EMA_LONG)
 
-    # Previous EMAs (exclude last price)
-    ema_short_prev = calculate_ema(prices[:-1], EMA_SHORT)
-    ema_long_prev = calculate_ema(prices[:-1], EMA_LONG)
-
     # Current RSI
     rsi = calculate_rsi(prices, RSI_PERIOD)
 
-    # Detect crossovers
-    crossover_up = ema_short_prev <= ema_long_prev and ema_short_now > ema_long_now
-    crossover_down = ema_short_prev >= ema_long_prev and ema_short_now < ema_long_now
-
-    if crossover_up and rsi < RSI_OVERSOLD:
+    # BUY when price is in a dip: EMA9 below EMA21 and RSI confirms oversold
+    if ema_short_now < ema_long_now and rsi < RSI_OVERSOLD:
         return "BUY"
-    elif crossover_down and rsi > RSI_OVERBOUGHT:
+    # SELL when price is extended: EMA9 above EMA21 and RSI confirms overbought
+    elif ema_short_now > ema_long_now and rsi > RSI_OVERBOUGHT:
         return "SELL"
     else:
         return "HOLD"

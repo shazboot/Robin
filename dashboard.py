@@ -24,6 +24,11 @@ state = {
     "starting_value": 0,
     "current_value": 0,
     "log_entries": [],  # list of {time, level, message}
+    "ema_gap": 0,           # EMA9 - EMA21
+    "rsi_gap_buy": 0,       # distance from RSI to buy threshold
+    "rsi_gap_sell": 0,      # distance from RSI to sell threshold
+    "buy_readiness": "",    # status text for how close to buy
+    "sell_readiness": "",   # status text for how close to sell
 }
 state_lock = threading.Lock()
 
@@ -33,10 +38,10 @@ def update_state(**kwargs):
         state.update(kwargs)
 
 
-def add_trade(side, price, quantity, amount):
+def add_trade(side, price, quantity, amount, timestamp=None):
     with state_lock:
         state["trades"].append({
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "time": timestamp or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "side": side,
             "price": round(price, 2),
             "quantity": round(quantity, 8),
@@ -66,6 +71,11 @@ def add_log(level, message):
         # Keep last 100 entries
         if len(state["log_entries"]) > 100:
             state["log_entries"] = state["log_entries"][-100:]
+
+
+def get_pnl() -> float:
+    with state_lock:
+        return state["total_pnl"]
 
 
 def _recalc_pnl():
@@ -118,6 +128,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .ind { text-align: center; }
   .ind .ind-label { font-size: 11px; color: #8b949e; }
   .ind .ind-val { font-size: 18px; font-weight: 600; margin-top: 2px; }
+  .ind .ind-gap { font-size: 11px; margin-top: 2px; color: #8b949e; }
+  .gap-pos { color: #3fb950; }
+  .gap-neg { color: #f85149; }
+  .gap-near { color: #d29922; }
+  .status-panel { margin-top: 16px; display: flex; gap: 16px; }
+  .status-box { flex: 1; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 12px 16px; }
+  .status-box .status-title { font-size: 11px; color: #8b949e; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px; }
+  .status-box .status-text { font-size: 14px; font-weight: 600; }
+  .ready-close { color: #d29922; }
+  .ready-far { color: #8b949e; }
+  .ready-go { color: #3fb950; }
   .no-trades { color: #484f58; text-align: center; padding: 32px; font-style: italic; }
   .log-panel { background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 12px; max-height: 300px; overflow-y: auto; font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace; font-size: 12px; line-height: 1.6; margin-top: 8px; }
   .log-line { white-space: pre-wrap; word-break: break-all; }
@@ -165,12 +186,38 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="card wide">
     <div class="label">Indicators</div>
     <div class="indicators">
-      <div class="ind"><div class="ind-label">EMA-9</div><div class="ind-val" id="ema9">--</div></div>
-      <div class="ind"><div class="ind-label">EMA-21</div><div class="ind-val" id="ema21">--</div></div>
-      <div class="ind"><div class="ind-label">RSI-14</div><div class="ind-val" id="rsi">--</div></div>
-      <div class="ind"><div class="ind-label">Data Points</div><div class="ind-val" id="dataPoints">--</div></div>
+      <div class="ind">
+        <div class="ind-label">EMA-9</div>
+        <div class="ind-val" id="ema9">--</div>
+        <div class="ind-gap" id="emaGap">--</div>
+      </div>
+      <div class="ind">
+        <div class="ind-label">EMA-21</div>
+        <div class="ind-val" id="ema21">--</div>
+        <div class="ind-gap" id="emaDirection">--</div>
+      </div>
+      <div class="ind">
+        <div class="ind-label">RSI-14</div>
+        <div class="ind-val" id="rsi">--</div>
+        <div class="ind-gap" id="rsiGap">--</div>
+      </div>
+      <div class="ind">
+        <div class="ind-label">Data Points</div>
+        <div class="ind-val" id="dataPoints">--</div>
+        <div class="ind-gap" id="dataStatus">--</div>
+      </div>
     </div>
     <div class="warmup-bar"><div class="warmup-fill" id="warmupBar"></div></div>
+    <div class="status-panel">
+      <div class="status-box">
+        <div class="status-title">Buy Readiness</div>
+        <div class="status-text" id="buyReadiness">--</div>
+      </div>
+      <div class="status-box">
+        <div class="status-title">Sell Readiness</div>
+        <div class="status-text" id="sellReadiness">--</div>
+      </div>
+    </div>
   </div>
 
   <div class="card wide">
@@ -308,6 +355,50 @@ async function refresh() {
     document.getElementById('dataPoints').textContent = d.data_points + '/' + d.required_points;
     document.getElementById('warmupBar').style.width = Math.min(100, d.data_points / d.required_points * 100) + '%';
     document.getElementById('lastUpdate').textContent = d.last_update;
+
+    // EMA gap
+    if (d.ema_short && d.ema_long) {
+      const gap = d.ema_gap;
+      const gapEl = document.getElementById('emaGap');
+      gapEl.textContent = 'Gap: ' + (gap >= 0 ? '+' : '') + '$' + fmt(Math.abs(gap));
+      gapEl.className = 'ind-gap ' + (Math.abs(gap) < 50 ? 'gap-near' : gap > 0 ? 'gap-pos' : 'gap-neg');
+      const dirEl = document.getElementById('emaDirection');
+      dirEl.textContent = gap > 0 ? 'EMA9 above' : gap < 0 ? 'EMA9 below' : 'Crossed';
+      dirEl.className = 'ind-gap ' + (Math.abs(gap) < 50 ? 'gap-near' : gap > 0 ? 'gap-pos' : 'gap-neg');
+    }
+
+    // RSI gap
+    if (d.rsi) {
+      const rsiGapEl = document.getElementById('rsiGap');
+      const buyDist = d.rsi_gap_buy;
+      const sellDist = d.rsi_gap_sell;
+      if (d.rsi < 50) {
+        rsiGapEl.textContent = fmt(Math.abs(buyDist)) + ' from buy zone';
+        rsiGapEl.className = 'ind-gap ' + (Math.abs(buyDist) < 5 ? 'gap-near' : buyDist <= 0 ? 'gap-pos' : 'gap-neg');
+      } else {
+        rsiGapEl.textContent = fmt(Math.abs(sellDist)) + ' from sell zone';
+        rsiGapEl.className = 'ind-gap ' + (Math.abs(sellDist) < 5 ? 'gap-near' : sellDist <= 0 ? 'gap-pos' : 'gap-neg');
+      }
+    }
+
+    // Data points status
+    const dsEl = document.getElementById('dataStatus');
+    if (d.data_points < d.required_points) {
+      const remaining = d.required_points - d.data_points;
+      dsEl.textContent = remaining + ' more needed';
+      dsEl.className = 'ind-gap gap-near';
+    } else {
+      dsEl.textContent = 'Active';
+      dsEl.className = 'ind-gap gap-pos';
+    }
+
+    // Buy/Sell readiness
+    const buyEl = document.getElementById('buyReadiness');
+    buyEl.textContent = d.buy_readiness || '--';
+    buyEl.className = 'status-text ' + (d.buy_readiness.includes('READY') ? 'ready-go' : d.buy_readiness.includes('Close') ? 'ready-close' : 'ready-far');
+    const sellEl = document.getElementById('sellReadiness');
+    sellEl.textContent = d.sell_readiness || '--';
+    sellEl.className = 'status-text ' + (d.sell_readiness.includes('READY') ? 'ready-go' : d.sell_readiness.includes('Close') ? 'ready-close' : 'ready-far');
     drawChart(d.price_history, d.trades);
     renderTrades(d.trades);
     renderLog(d.log_entries || []);
