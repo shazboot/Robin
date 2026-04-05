@@ -1,6 +1,7 @@
 import base64
 import datetime
 import json
+import time
 from typing import Any, Dict, Optional
 import uuid
 import requests
@@ -10,6 +11,10 @@ from config import API_KEY, BASE64_PRIVATE_KEY, API_VERSION
 
 
 class CryptoAPITrading:
+    BASE_RETRY_DELAY = 1    # Initial retry delay in seconds
+    MAX_RETRY_DELAY = 30    # Maximum backoff delay
+    MAX_RETRIES = 3         # Max retries per request
+
     def __init__(self):
         self.api_key = API_KEY
         private_key_seed = base64.b64decode(BASE64_PRIVATE_KEY)
@@ -44,29 +49,51 @@ class CryptoAPITrading:
         }
 
     def make_api_request(self, method: str, path: str, body: str = "") -> Any:
-        timestamp = self._get_current_timestamp()
-        headers = self._get_authorization_header(method, path, body, timestamp)
-        url = self.base_url + path
+        delay = self.BASE_RETRY_DELAY
+        last_error = None
 
-        try:
-            if method == "GET":
-                response = requests.get(url, headers=headers, timeout=10)
-            elif method == "POST":
-                response = requests.post(
-                    url,
-                    headers=headers,
-                    json=json.loads(body) if body else None,
-                    timeout=10,
-                )
-            else:
-                raise ValueError(f"Unsupported method: {method}")
+        for attempt in range(self.MAX_RETRIES + 1):
+            timestamp = self._get_current_timestamp()
+            headers = self._get_authorization_header(method, path, body, timestamp)
+            url = self.base_url + path
 
-            if response.status_code >= 400:
-                print(f"HTTP Error {response.status_code}: {response.text}")
-            return response.json()
-        except requests.RequestException as e:
-            print(f"Error making API request: {e}")
-            return None
+            try:
+                if method == "GET":
+                    response = requests.get(url, headers=headers, timeout=10)
+                elif method == "POST":
+                    response = requests.post(
+                        url,
+                        headers=headers,
+                        json=json.loads(body) if body else None,
+                        timeout=10,
+                    )
+                else:
+                    raise ValueError(f"Unsupported method: {method}")
+
+                if response.status_code == 429 or response.status_code >= 500:
+                    # Rate limited or server error — retry with backoff
+                    last_error = f"HTTP {response.status_code}: {response.text}"
+                    if attempt < self.MAX_RETRIES:
+                        print(f"API {response.status_code}, retrying in {delay}s (attempt {attempt + 1}/{self.MAX_RETRIES})...")
+                        time.sleep(delay)
+                        delay = min(delay * 2, self.MAX_RETRY_DELAY)
+                        continue
+
+                if response.status_code >= 400:
+                    print(f"HTTP Error {response.status_code}: {response.text}")
+                return response.json()
+            except requests.RequestException as e:
+                last_error = str(e)
+                if attempt < self.MAX_RETRIES:
+                    print(f"API request failed, retrying in {delay}s (attempt {attempt + 1}/{self.MAX_RETRIES}): {e}")
+                    time.sleep(delay)
+                    delay = min(delay * 2, self.MAX_RETRY_DELAY)
+                    continue
+                print(f"Error making API request after {self.MAX_RETRIES} retries: {e}")
+                return None
+
+        print(f"API request failed after {self.MAX_RETRIES} retries: {last_error}")
+        return None
 
     # ---- Account ----
 

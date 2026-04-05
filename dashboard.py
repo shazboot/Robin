@@ -3,6 +3,9 @@ import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
 
+from backtest import fetch_binance_klines, run_sweep_results, check_better_config
+from config import BACKTEST_SYMBOL
+
 DASHBOARD_PORT = 4501
 
 # Shared state — updated by trader, read by dashboard
@@ -38,8 +41,35 @@ state = {
     "bb_lower": 0,
     "trend_status": "--",
     "macd_status": "--",
+    "trend_strength": "--",
+    "bb_bandwidth": 0,
+    "bb_squeeze": "--",
+    "atr": 0,
+    "atr_pct": 0,
+    "volume_confirmed": True,
+    "divergence": "NONE",
+    "direction_15m": "WARMUP",
+    "looking_for_entry": False,
+    "entry_window_remaining": 0,
+    "entry_type": "",
+    "data_points_15m": 0,
+    "candles_15m": 0,
+    "ema_short_15m": 0,
+    "ema_long_15m": 0,
+    "ema_trend_15m": 0,
+    "rsi_15m": 0,
+    "macd_hist_15m": 0,
+    "trend_strength_15m": "--",
+    "analytics": {},
+    "daily_pnl": 0,
+    "daily_drawdown_pct": 0,
+    "trading_halted": False,
 }
 state_lock = threading.Lock()
+
+# Backtest sweep state
+backtest_state = {"status": "idle", "progress": "", "results": [], "error": ""}
+backtest_lock = threading.Lock()
 
 
 def update_state(**kwargs):
@@ -136,8 +166,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .pnl-zero { color: #8b949e; }
   .wide { grid-column: 1 / -1; }
   #priceChart { width: 100%; height: 400px; }
-  #rsiChart { width: 100%; height: 150px; margin-top: 4px; }
-  #macdChart { width: 100%; height: 150px; margin-top: 4px; }
+  #rsiChart { width: 100%; height: 120px; }
+  #macdChart { width: 100%; height: 120px; }
   table { width: 100%; border-collapse: collapse; margin-top: 12px; }
   th { text-align: left; font-size: 11px; color: #8b949e; text-transform: uppercase; letter-spacing: 1px; padding: 8px 12px; border-bottom: 1px solid #30363d; }
   td { padding: 8px 12px; border-bottom: 1px solid #21262d; font-size: 14px; }
@@ -146,7 +176,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .side-sell { color: #f85149; font-weight: 600; }
   .warmup-bar { background: #21262d; border-radius: 4px; height: 8px; margin-top: 8px; overflow: hidden; }
   .warmup-fill { background: #58a6ff; height: 100%; border-radius: 4px; transition: width 0.5s; }
-  .indicators { display: flex; gap: 24px; margin-top: 8px; }
+  .indicators { display: flex; flex-wrap: wrap; gap: 24px; margin-top: 8px; }
   .ind { text-align: center; }
   .ind .ind-label { font-size: 11px; color: #8b949e; }
   .ind .ind-val { font-size: 18px; font-weight: 600; margin-top: 2px; }
@@ -171,6 +201,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .log-BUY { color: #3fb950; font-weight: 600; }
   .log-SELL { color: #f85149; font-weight: 600; }
   .log-separator { color: #30363d; }
+  @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+  #btTable th { white-space: nowrap; }
+  #btTable td { font-size: 13px; }
+  .bt-best { background: rgba(35,134,54,0.15); }
+  .bt-best td:first-child::after { content: " RECOMMENDED"; font-size: 10px; color: #3fb950; font-weight: 600; }
   .chart-legend { display: flex; gap: 16px; margin-top: 8px; font-size: 12px; }
   .legend-item { display: flex; align-items: center; gap: 4px; }
   .legend-color { width: 12px; height: 3px; border-radius: 2px; }
@@ -242,6 +277,31 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="ind-gap" id="bbStatus">--</div>
       </div>
       <div class="ind">
+        <div class="ind-label">ATR</div>
+        <div class="ind-val" id="atrVal">--</div>
+        <div class="ind-gap" id="atrStatus">--</div>
+      </div>
+      <div class="ind">
+        <div class="ind-label">Volume</div>
+        <div class="ind-val" id="volVal">--</div>
+        <div class="ind-gap" id="volStatus">--</div>
+      </div>
+      <div class="ind">
+        <div class="ind-label">15m Direction</div>
+        <div class="ind-val" id="dir15m">--</div>
+        <div class="ind-gap" id="dir15mStatus">--</div>
+      </div>
+      <div class="ind">
+        <div class="ind-label">Entry Status</div>
+        <div class="ind-val" id="entryVal">--</div>
+        <div class="ind-gap" id="entryStatus">--</div>
+      </div>
+      <div class="ind">
+        <div class="ind-label">Divergence</div>
+        <div class="ind-val" id="divVal">--</div>
+        <div class="ind-gap" id="divStatus">--</div>
+      </div>
+      <div class="ind">
         <div class="ind-label">Data Points</div>
         <div class="ind-val" id="dataPoints">--</div>
         <div class="ind-gap" id="dataStatus">--</div>
@@ -260,8 +320,85 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
-  <div class="card wide">
-    <div class="label">Price Chart</div>
+  <div class="card wide" id="perfCard" style="display:none;">
+    <div class="label">Performance</div>
+    <div class="indicators">
+      <div class="ind">
+        <div class="ind-label">Win Rate</div>
+        <div class="ind-val" id="perfWinRate">--</div>
+        <div class="ind-gap" id="perfWL">--</div>
+      </div>
+      <div class="ind">
+        <div class="ind-label">Profit Factor</div>
+        <div class="ind-val" id="perfPF">--</div>
+        <div class="ind-gap">&nbsp;</div>
+      </div>
+      <div class="ind">
+        <div class="ind-label">Avg Win</div>
+        <div class="ind-val gap-pos" id="perfAvgWin">--</div>
+        <div class="ind-gap">Avg Loss: <span id="perfAvgLoss">--</span></div>
+      </div>
+      <div class="ind">
+        <div class="ind-label">Max Drawdown</div>
+        <div class="ind-val" id="perfMaxDD">--</div>
+        <div class="ind-gap">&nbsp;</div>
+      </div>
+      <div class="ind">
+        <div class="ind-label">Best Trade</div>
+        <div class="ind-val gap-pos" id="perfBest">--</div>
+        <div class="ind-gap">Worst: <span id="perfWorst">--</span></div>
+      </div>
+      <div class="ind">
+        <div class="ind-label">Streak</div>
+        <div class="ind-val" id="perfStreak">--</div>
+        <div class="ind-gap">&nbsp;</div>
+      </div>
+      <div class="ind">
+        <div class="ind-label">Daily P&L</div>
+        <div class="ind-val" id="perfDailyPnl">--</div>
+        <div class="ind-gap" id="perfDailyPct">--</div>
+      </div>
+      <div class="ind">
+        <div class="ind-label">Status</div>
+        <div class="ind-val" id="perfStatus">--</div>
+        <div class="ind-gap">&nbsp;</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card wide" id="backtestCard">
+    <div class="label">Backtest Sweep</div>
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;">
+      <label style="font-size:13px;color:#8b949e;">Days:</label>
+      <input type="number" id="btDays" value="30" min="1" max="365"
+             style="width:70px;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#c9d1d9;padding:6px 8px;font-size:14px;">
+      <button id="btRunBtn" onclick="startBacktest()"
+              style="background:#238636;color:#fff;border:none;border-radius:6px;padding:8px 18px;font-size:14px;font-weight:600;cursor:pointer;">
+        Run Sweep
+      </button>
+      <span id="btStatus" style="font-size:13px;color:#8b949e;"></span>
+    </div>
+    <div id="btProgress" style="font-size:13px;color:#8b949e;margin-bottom:8px;display:none;">
+      <span style="display:inline-block;animation:spin 1s linear infinite;margin-right:6px;">&#9881;</span>
+      <span id="btProgressText"></span>
+    </div>
+    <div id="btError" style="color:#f85149;font-size:13px;margin-bottom:8px;display:none;"></div>
+    <div id="btResults" style="display:none;overflow-x:auto;">
+      <table id="btTable">
+        <thead>
+          <tr>
+            <th>Rank</th><th>SL%</th><th>MinProfit%</th><th>EntryWin</th>
+            <th>Trades</th><th>W/L</th><th>WinRate</th><th>PF</th>
+            <th>Total P&amp;L</th><th>MaxDD</th>
+          </tr>
+        </thead>
+        <tbody id="btBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card wide" style="padding-bottom:8px;">
+    <div class="label">Chart</div>
     <div class="chart-legend">
       <div class="legend-item"><div class="legend-color" style="background:#2962FF"></div> Price</div>
       <div class="legend-item"><div class="legend-color" style="background:#FF6D00"></div> EMA-9</div>
@@ -270,17 +407,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="legend-item"><div class="legend-color" style="background:rgba(33,150,243,0.3)"></div> Bollinger</div>
       <div class="legend-item"><div class="legend-color" style="background:#3fb950"></div> Buy</div>
       <div class="legend-item"><div class="legend-color" style="background:#f85149"></div> Sell</div>
+      <div class="legend-item"><div class="legend-color" style="background:#E040FB"></div> RSI</div>
+      <div class="legend-item"><div class="legend-color" style="background:#2962FF;height:2px"></div> MACD</div>
     </div>
     <div id="priceChart"></div>
-  </div>
-
-  <div class="card wide">
-    <div class="label">RSI (14)</div>
+    <div style="color:#8b949e;font-size:11px;padding:4px 0 2px 8px;">RSI (14)</div>
     <div id="rsiChart"></div>
-  </div>
-
-  <div class="card wide">
-    <div class="label">MACD (12, 26, 9)</div>
+    <div style="color:#8b949e;font-size:11px;padding:4px 0 2px 8px;">MACD (12, 26, 9)</div>
     <div id="macdChart"></div>
   </div>
 
@@ -308,7 +441,9 @@ const chartOptions = {
 };
 
 // Price chart with EMAs + Bollinger Bands
-const priceChart = LightweightCharts.createChart(document.getElementById('priceChart'), chartOptions);
+const priceChartOpts = JSON.parse(JSON.stringify(chartOptions));
+priceChartOpts.timeScale.visible = false;
+const priceChart = LightweightCharts.createChart(document.getElementById('priceChart'), priceChartOpts);
 const priceSeries = priceChart.addLineSeries({ color: '#2962FF', lineWidth: 2, priceFormat: { type: 'price', precision: 2, minMove: 0.01 } });
 const ema9Series = priceChart.addLineSeries({ color: '#FF6D00', lineWidth: 1 });
 const ema21Series = priceChart.addLineSeries({ color: '#AA00FF', lineWidth: 1 });
@@ -318,6 +453,7 @@ const bbLowerSeries = priceChart.addLineSeries({ color: 'rgba(33,150,243,0.3)', 
 
 // RSI chart
 const rsiChartOpts = JSON.parse(JSON.stringify(chartOptions));
+rsiChartOpts.timeScale.visible = false;
 const rsiChart = LightweightCharts.createChart(document.getElementById('rsiChart'), rsiChartOpts);
 const rsiSeries = rsiChart.addLineSeries({ color: '#E040FB', lineWidth: 2, priceFormat: { type: 'price', precision: 1, minMove: 0.1 } });
 const rsiOverbought = rsiChart.addLineSeries({ color: 'rgba(248,81,73,0.4)', lineWidth: 1, lineStyle: 2 });
@@ -425,8 +561,8 @@ const resizeObserver = new ResizeObserver(() => {
   const rsiEl = document.getElementById('rsiChart');
   const macdEl = document.getElementById('macdChart');
   priceChart.applyOptions({ width: priceEl.clientWidth, height: 400 });
-  rsiChart.applyOptions({ width: rsiEl.clientWidth, height: 150 });
-  macdChart.applyOptions({ width: macdEl.clientWidth, height: 150 });
+  rsiChart.applyOptions({ width: rsiEl.clientWidth, height: 120 });
+  macdChart.applyOptions({ width: macdEl.clientWidth, height: 120 });
 });
 resizeObserver.observe(document.getElementById('priceChart'));
 
@@ -508,11 +644,11 @@ async function refresh() {
       }
     }
 
-    // EMA-50 Trend status
+    // EMA-50 Trend status (slope-based)
     if (d.ema_trend) {
       const trendEl = document.getElementById('trendStatus');
-      const ts = d.trend_status || '--';
-      trendEl.textContent = ts === 'UP' ? 'Price above' : ts === 'DOWN' ? 'Price below' : '--';
+      const ts = d.trend_strength || '--';
+      trendEl.textContent = ts === 'UP' ? 'Strengthening' : ts === 'DOWN' ? 'Weakening' : 'Flat';
       trendEl.className = 'ind-gap ' + (ts === 'UP' ? 'gap-pos' : ts === 'DOWN' ? 'gap-neg' : '');
     }
 
@@ -524,13 +660,47 @@ async function refresh() {
       macdStEl.className = 'ind-gap ' + (ms === 'Bullish' ? 'gap-pos' : ms === 'Bearish' ? 'gap-neg' : '');
     }
 
-    // Bollinger status
-    if (d.bb_upper && d.bb_lower) {
+    // Bollinger status (squeeze detection)
+    if (d.bb_squeeze) {
       const bbStEl = document.getElementById('bbStatus');
-      const p = d.current_price;
-      if (p >= d.bb_upper) { bbStEl.textContent = 'At upper band'; bbStEl.className = 'ind-gap gap-neg'; }
-      else if (p <= d.bb_lower) { bbStEl.textContent = 'At lower band'; bbStEl.className = 'ind-gap gap-pos'; }
-      else { bbStEl.textContent = '$' + fmt(d.bb_lower) + ' - $' + fmt(d.bb_upper); bbStEl.className = 'ind-gap'; }
+      const sq = d.bb_squeeze || '--';
+      if (sq === 'EXPANDING') { bbStEl.textContent = 'Expanding (BW: ' + (d.bb_bandwidth || 0).toFixed(2) + '%)'; bbStEl.className = 'ind-gap gap-pos'; }
+      else if (sq === 'CONTRACTING') { bbStEl.textContent = 'Squeezing (BW: ' + (d.bb_bandwidth || 0).toFixed(2) + '%)'; bbStEl.className = 'ind-gap gap-neg'; }
+      else { bbStEl.textContent = 'Neutral (BW: ' + (d.bb_bandwidth || 0).toFixed(2) + '%)'; bbStEl.className = 'ind-gap'; }
+    }
+
+    // ATR status
+    if (d.atr) {
+      document.getElementById('atrVal').textContent = '$' + fmt(d.atr);
+      const atrStEl = document.getElementById('atrStatus');
+      atrStEl.textContent = d.atr_pct.toFixed(3) + '% volatility';
+      atrStEl.className = 'ind-gap ' + (d.atr_pct > 2 ? 'gap-neg' : d.atr_pct > 1 ? 'gap-near' : 'gap-pos');
+    }
+
+    // Volume status
+    const volEl = document.getElementById('volVal');
+    const volStEl = document.getElementById('volStatus');
+    volEl.textContent = d.volume_confirmed ? 'Confirmed' : 'Low';
+    volEl.className = 'ind-val ' + (d.volume_confirmed ? 'gap-pos' : 'gap-neg');
+    volStEl.textContent = d.volume_confirmed ? 'Above average' : 'Below average';
+    volStEl.className = 'ind-gap ' + (d.volume_confirmed ? 'gap-pos' : 'gap-neg');
+
+    // Divergence status
+    const divEl = document.getElementById('divVal');
+    const divStEl = document.getElementById('divStatus');
+    divEl.textContent = d.divergence || 'NONE';
+    if (d.divergence === 'BULLISH') {
+      divEl.className = 'ind-val gap-pos';
+      divStEl.textContent = 'Hidden strength';
+      divStEl.className = 'ind-gap gap-pos';
+    } else if (d.divergence === 'BEARISH') {
+      divEl.className = 'ind-val gap-neg';
+      divStEl.textContent = 'Hidden weakness';
+      divStEl.className = 'ind-gap gap-neg';
+    } else {
+      divEl.className = 'ind-val';
+      divStEl.textContent = 'No divergence';
+      divStEl.className = 'ind-gap';
     }
 
     // Data points status
@@ -552,6 +722,72 @@ async function refresh() {
     sellEl.textContent = d.sell_readiness || '--';
     sellEl.className = 'status-text ' + (d.sell_readiness.includes('READY') ? 'ready-go' : d.sell_readiness.includes('Close') ? 'ready-close' : 'ready-far');
 
+    // 15m Direction
+    const dir15 = d.direction_15m || 'WARMUP';
+    const dir15El = document.getElementById('dir15m');
+    dir15El.textContent = dir15;
+    dir15El.className = 'ind-val ' + (dir15 === 'BUY' ? 'gap-pos' : dir15 === 'SELL' ? 'gap-neg' : dir15 === 'WARMUP' ? '' : 'gap-near');
+    const dir15s = document.getElementById('dir15mStatus');
+    if (dir15 === 'WARMUP') {
+      dir15s.textContent = (d.candles_15m || 0) + ' candles';
+      dir15s.className = 'ind-gap gap-near';
+    } else {
+      dir15s.textContent = 'RSI: ' + (d.rsi_15m || 0).toFixed(1) + ' | ' + (d.trend_strength_15m || '--');
+      dir15s.className = 'ind-gap ' + (dir15 === 'BUY' ? 'gap-pos' : dir15 === 'SELL' ? 'gap-neg' : '');
+    }
+
+    // Entry Status
+    const entryEl = document.getElementById('entryVal');
+    const entrySt = document.getElementById('entryStatus');
+    if (d.looking_for_entry) {
+      entryEl.textContent = 'SEARCHING';
+      entryEl.className = 'ind-val gap-near';
+      entrySt.textContent = (d.entry_window_remaining || 0) + 's remaining';
+      entrySt.className = 'ind-gap gap-near';
+    } else if (d.entry_type) {
+      entryEl.textContent = d.entry_type;
+      entryEl.className = 'ind-val gap-pos';
+      entrySt.textContent = 'Last entry type';
+      entrySt.className = 'ind-gap';
+    } else {
+      entryEl.textContent = 'Idle';
+      entryEl.className = 'ind-val';
+      entrySt.textContent = 'Waiting for 15m BUY';
+      entrySt.className = 'ind-gap';
+    }
+
+    // Performance analytics
+    const a = d.analytics || {};
+    const perfCard = document.getElementById('perfCard');
+    if (a.total_trades) {
+      perfCard.style.display = '';
+      document.getElementById('perfWinRate').textContent = a.win_rate + '%';
+      document.getElementById('perfWinRate').className = 'ind-val ' + (a.win_rate >= 50 ? 'gap-pos' : 'gap-neg');
+      document.getElementById('perfWL').textContent = a.wins + 'W / ' + a.losses + 'L (' + a.total_trades + ' total)';
+      document.getElementById('perfPF').textContent = a.profit_factor;
+      document.getElementById('perfPF').className = 'ind-val ' + (parseFloat(a.profit_factor) > 1 ? 'gap-pos' : 'gap-neg');
+      document.getElementById('perfAvgWin').textContent = '+' + a.avg_win_pct + '%';
+      document.getElementById('perfAvgLoss').textContent = a.avg_loss_pct + '%';
+      document.getElementById('perfMaxDD').textContent = a.max_drawdown_pct + '%';
+      document.getElementById('perfMaxDD').className = 'ind-val gap-neg';
+      document.getElementById('perfBest').textContent = '$' + fmt(a.best_trade);
+      document.getElementById('perfWorst').textContent = '$' + fmt(a.worst_trade);
+      const streak = a.current_streak;
+      document.getElementById('perfStreak').textContent = Math.abs(streak) + (streak > 0 ? ' wins' : ' losses');
+      document.getElementById('perfStreak').className = 'ind-val ' + (streak > 0 ? 'gap-pos' : 'gap-neg');
+    }
+
+    // Daily P&L
+    const dpnl = d.daily_pnl || 0;
+    const dpnlEl = document.getElementById('perfDailyPnl');
+    dpnlEl.textContent = (dpnl >= 0 ? '+$' : '-$') + fmt(Math.abs(dpnl));
+    dpnlEl.className = 'ind-val ' + (dpnl >= 0 ? 'gap-pos' : 'gap-neg');
+    document.getElementById('perfDailyPct').textContent = (d.daily_drawdown_pct || 0).toFixed(2) + '%';
+    const statusEl = document.getElementById('perfStatus');
+    statusEl.textContent = d.trading_halted ? 'HALTED' : 'ACTIVE';
+    statusEl.className = 'ind-val ' + (d.trading_halted ? 'gap-neg' : 'gap-pos');
+    if (a.total_trades || d.daily_pnl) perfCard.style.display = '';
+
     updateCharts(d.price_history, d.trades);
     renderTrades(d.trades);
     renderLog(d.log_entries || []);
@@ -560,9 +796,144 @@ async function refresh() {
 
 refresh();
 setInterval(refresh, 1000);
+
+// ---- Backtest Sweep ----
+let btPolling = null;
+
+async function startBacktest() {
+  const days = parseInt(document.getElementById('btDays').value) || 30;
+  const btn = document.getElementById('btRunBtn');
+  btn.disabled = true;
+  btn.textContent = 'Running...';
+  btn.style.opacity = '0.6';
+  document.getElementById('btProgress').style.display = '';
+  document.getElementById('btError').style.display = 'none';
+  document.getElementById('btResults').style.display = 'none';
+  document.getElementById('btStatus').textContent = '';
+
+  try {
+    const r = await fetch('/api/backtest', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({days: days})
+    });
+    const d = await r.json();
+    if (d.error) {
+      document.getElementById('btError').textContent = d.error;
+      document.getElementById('btError').style.display = '';
+      resetBtBtn();
+      return;
+    }
+  } catch(e) {
+    document.getElementById('btError').textContent = 'Request failed: ' + e;
+    document.getElementById('btError').style.display = '';
+    resetBtBtn();
+    return;
+  }
+
+  if (btPolling) clearInterval(btPolling);
+  btPolling = setInterval(pollBacktest, 2000);
+}
+
+async function pollBacktest() {
+  try {
+    const r = await fetch('/api/backtest');
+    const d = await r.json();
+    document.getElementById('btProgressText').textContent = d.progress || '';
+
+    if (d.status === 'done') {
+      clearInterval(btPolling);
+      btPolling = null;
+      document.getElementById('btProgress').style.display = 'none';
+      renderBtResults(d.results);
+      resetBtBtn();
+      document.getElementById('btStatus').textContent = d.progress;
+    } else if (d.status === 'error') {
+      clearInterval(btPolling);
+      btPolling = null;
+      document.getElementById('btProgress').style.display = 'none';
+      document.getElementById('btError').textContent = d.error;
+      document.getElementById('btError').style.display = '';
+      resetBtBtn();
+    }
+  } catch(e) { console.error('Backtest poll failed:', e); }
+}
+
+function resetBtBtn() {
+  const btn = document.getElementById('btRunBtn');
+  btn.disabled = false;
+  btn.textContent = 'Run Sweep';
+  btn.style.opacity = '1';
+}
+
+function renderBtResults(results) {
+  if (!results || !results.length) {
+    document.getElementById('btResults').style.display = '';
+    document.getElementById('btBody').innerHTML = '<tr><td colspan="10" style="text-align:center;color:#484f58;">No combinations produced trades</td></tr>';
+    return;
+  }
+  let html = '';
+  const top = Math.min(results.length, 20);
+  for (let i = 0; i < top; i++) {
+    const r = results[i];
+    const sl = (r.stop_loss * 100).toFixed(0) + '%';
+    const mp = (r.min_profit * 100).toFixed(1) + '%';
+    const sc = r.entry_window + 's';
+    const wl = r.wins + 'W/' + r.losses + 'L';
+    const wr = r.win_rate.toFixed(1) + '%';
+    const pf = (typeof r.profit_factor === 'number' && r.profit_factor < 999) ? r.profit_factor.toFixed(2) : 'Inf';
+    const pnl = r.total_pnl;
+    const pnlStr = (pnl >= 0 ? '+$' : '-$') + Math.abs(pnl).toFixed(2);
+    const pnlCls = pnl >= 0 ? 'gap-pos' : 'gap-neg';
+    const dd = '$' + r.max_drawdown.toFixed(2);
+    const rowCls = i === 0 ? ' class="bt-best"' : '';
+    html += '<tr' + rowCls + '><td>' + (i+1) + '</td><td>' + sl + '</td><td>' + mp + '</td><td>' + sc +
+      '</td><td>' + r.total_trades + '</td><td>' + wl + '</td><td>' + wr + '</td><td>' + pf +
+      '</td><td class="' + pnlCls + '">' + pnlStr + '</td><td class="gap-neg">' + dd + '</td></tr>';
+  }
+  document.getElementById('btBody').innerHTML = html;
+  document.getElementById('btResults').style.display = '';
+}
 </script>
 </body>
 </html>"""
+
+
+def _run_backtest_thread(days):
+    """Background thread that runs the backtest sweep."""
+    try:
+        with backtest_lock:
+            backtest_state["progress"] = f"Fetching {days} days of candle data..."
+
+        candles = fetch_binance_klines(BACKTEST_SYMBOL, "1m", days)
+        if not candles:
+            with backtest_lock:
+                backtest_state["status"] = "error"
+                backtest_state["error"] = "Failed to fetch candle data from Binance."
+            return
+
+        def progress_cb(msg):
+            with backtest_lock:
+                backtest_state["progress"] = msg
+
+        results = run_sweep_results(candles, days, progress_cb=progress_cb)
+
+        # Check for better config and alert
+        alert = check_better_config(results)
+
+        with backtest_lock:
+            backtest_state["results"] = results
+            backtest_state["status"] = "done"
+            backtest_state["progress"] = f"Complete — {len(results)} configs with trades"
+            if alert:
+                backtest_state["alert"] = alert
+
+        if alert:
+            add_log("WARNING", alert)
+    except Exception as e:
+        with backtest_lock:
+            backtest_state["status"] = "error"
+            backtest_state["error"] = f"{type(e).__name__}: {e}"
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -574,11 +945,56 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(data.encode())
+        elif self.path == "/api/backtest":
+            with backtest_lock:
+                data = json.dumps(backtest_state)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(data.encode())
         else:
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.end_headers()
             self.wfile.write(DASHBOARD_HTML.encode())
+
+    def do_POST(self):
+        if self.path == "/api/backtest":
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length) if content_length else b"{}"
+            try:
+                params = json.loads(body)
+            except json.JSONDecodeError:
+                params = {}
+
+            days = params.get("days", 30)
+            days = max(1, min(days, 365))
+
+            with backtest_lock:
+                if backtest_state["status"] == "running":
+                    resp = json.dumps({"error": "already running"})
+                    self.send_response(409)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(resp.encode())
+                    return
+
+                backtest_state["status"] = "running"
+                backtest_state["progress"] = "Starting..."
+                backtest_state["results"] = []
+                backtest_state["error"] = ""
+
+            t = threading.Thread(target=_run_backtest_thread, args=(days,), daemon=True)
+            t.start()
+
+            resp = json.dumps({"status": "started"})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(resp.encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
 
     def log_message(self, format, *args):
         pass  # Suppress HTTP request logs
